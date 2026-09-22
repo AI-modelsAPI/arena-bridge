@@ -1,0 +1,8 @@
+node_modules/
+.env
+config.json
+prompt.txt
+.t/
+*.log
+*.tgz
+.DS_Store
