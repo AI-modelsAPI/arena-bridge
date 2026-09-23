@@ -75,7 +75,10 @@ Each request must carry a unique `rid`: a GET can be prefetched or retried by th
 ## Security notes
 
 * The token is a shell on every attached machine; treat it like a root password. Rotate: edit `.env`, `docker compose up -d`, re-run the device install lines.
-* The directory policy is enforced on the hub. Path tools are checked exactly; `bash`/`start_process` are checked heuristically (cwd + paths in the command, `..` always counts as outside). It is a guard rail against an agent wandering, not a sandbox against a hostile one.
+* **Credential-read protection (on by default):** reading obvious secrets (`.ssh/*`, `.env`, `*.pem`/`*.key`, `.aws/`, `.git-credentials`, `id_rsa`…) requires an unlock first, so a leaked token cannot silently exfiltrate keys. Set `SENSITIVE_READ_OPEN=1` to disable. Everything else is still readable without a password.
+* The directory policy is enforced on the hub. Path tools are checked exactly; `bash`/`start_process` are checked heuristically (cwd + paths in the command, `..` always counts as outside). `kill_process` and `self_update` change state and are gated until unlock; `write_process` (stdin to a session you started) stays available for interactive work. It is a guard rail against an agent wandering, not a sandbox against a hostile one.
+* **Audit log:** every state-changing call (exec/write/edit/delete/kill/unlock/lock) is appended as a JSON line to `<HOME>/audit.log` (the `/data` volume) — token and password are never written. Set `AUDIT_LOG=off` to disable or `AUDIT_LOG=/path` to relocate.
+* Prefer the `Authorization`/`x-token` header over `?token=` in a URL (query strings can land in proxy logs and browser history); responses are sent with `Referrer-Policy: no-referrer`.
 * Behind Cloudflare's proxy single requests are cut at 100 s and uploads at 100 MB; the prompt teaches the agent to use process sessions for long jobs. Direct (Caddy) deployments have no such limit.
 
 ## Alternative: hub on your Mac

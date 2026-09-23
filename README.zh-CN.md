@@ -67,7 +67,10 @@ GET /call?token=…&rid=<唯一值>&tool=mac__read_file&args=<url编码JSON>
 ## 安全说明
 
 * token 等于所有接入��器的 shell 权限。换 token：改 `.env` → `docker compose up -d` → 各设备重跑安装命令。
-* 目录策略在 hub 上统一执行；路径类工具精确判断，`bash` / `start_process` 按 cwd 和命令里出现的路径启发式判断（出现 `..` 一律视为越界）。它防的是 agent 乱跑，不是对抗恶意 agent 的沙箱。
+* **凭据读保护（默认开）**：读取明显的机密文件（`.ssh/*`、`.env`、`*.pem`/`*.key`、`.aws/`、`.git-credentials`、`id_rsa`…）需先解锁，避免 token 泄露后被直接读走密钥。设 `SENSITIVE_READ_OPEN=1` 关闭。其余文件仍可无密码读取。
+* 目录策略在 hub 上统一执行；路径类工具精确判断，`bash` / `start_process` 按 cwd 和命令里出现的路径启发式判断（出现 `..` 一律视为越界）。`kill_process`、`self_update` 会改状态，未解锁前被拦；`write_process`（给你自己起的会话喂 stdin）保持放行以便交互调试。它防的是 agent 乱跑，不是对抗恶意 agent 的沙箱。
+* **审计日志**：每次改状态的调用（exec/写/改/删/kill/解锁/上锁）以 JSON 行追加到 `<HOME>/audit.log`（`/data` 卷）——绝不写入 token 和密码。设 `AUDIT_LOG=off` 关闭，或 `AUDIT_LOG=/路径` 改位置。
+* 优先用 `Authorization`/`x-token` 头而非 URL 里的 `?token=`（查询串可能进代理日志和浏览器历史）；响应带 `Referrer-Policy: no-referrer`。
 * 经 Cloudflare 代理时单次请求 100 秒、上传 100MB 上限；提示词已教 agent 用进程会话处理长任务。直连（Caddy）无此限制。
 
 ## 备选：hub 跑在 Mac 上

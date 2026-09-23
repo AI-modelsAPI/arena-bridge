@@ -137,9 +137,22 @@ async function callTool(name, args = {}) {
   else if (prefix && !devices.has(prefix) && !local.tools[name]) res = textResult(`unknown tool or device offline: ${name}. Online devices: ${[...devices.keys()].join(', ') || '(none)'}; hub is "${LOCAL}"`, true);
   else res = textResult(`unknown tool: ${name}`, true);
   log(`call ${name} ${JSON.stringify(args).slice(0, 100)} -> ${res.isError ? 'ERR' : 'ok'} ${Date.now() - t0}ms`);
+  const auditName = name === 'unlock' || name === 'lock' ? name : rest;
+  if (MUTATING.has(auditName)) audit({ target, tool: name, args: auditName === 'unlock' ? '{"password":"***"}' : auditArgs(args), ok: !res.isError, ms: Date.now() - t0 });
   return res;
 }
 const flatten = res => ({ ok: !res.isError, isError: !!res.isError, text: (res.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n'), content: res.content });
+
+// ---------- audit log for state-changing calls ----------
+// Appends one JSON line per mutating call (write/edit/delete/exec/unlock/lock/kill/self_update/binary write).
+// Args are truncated and never include the token. Path: AUDIT_LOG or <HOME>/audit.log; off if AUDIT_LOG=off.
+const MUTATING = new Set(['bash', 'start_process', 'write_process', 'kill_process', 'write_file', 'edit_file', 'delete_path', 'write_file_base64', 'self_update', 'unlock', 'lock']);
+const AUDIT_PATH = process.env.AUDIT_LOG === 'off' ? null : (process.env.AUDIT_LOG || path.join(HOME, 'audit.log'));
+function audit(entry) {
+  if (!AUDIT_PATH) return;
+  try { fs.appendFileSync(AUDIT_PATH, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n'); } catch (e) { log(`audit write failed: ${e.message}`); }
+}
+const auditArgs = args => { const s = JSON.stringify(args || {}); return s.length > 300 ? s.slice(0, 300) + '…' : s; };
 
 // ---------- GET-compat idempotency (prefetch/retry safety) ----------
 // A GET can be replayed by the platform's fetcher (speculative prefetch, retry, double-open).
@@ -166,6 +179,8 @@ const META_TOOL_NAMES = new Set(META_TOOLS.map(t => t.name));
 // ---------- HTTP ----------
 const app = express();
 app.set('trust proxy', true); app.disable('x-powered-by');
+// Keep the URL (which may carry ?token=) out of Referer headers to third parties.
+app.use((_req, res, next) => { res.set('Referrer-Policy', 'no-referrer'); next(); });
 app.get('/health', (_req, res) => res.json({ ok: true, hub: LOCAL, tools: allTools().length, devices: [...devices.keys()], uptime: process.uptime() }));
 app.use((req, res, next) => {
   const h = req.get('authorization') || '';
@@ -175,8 +190,8 @@ app.use((req, res, next) => {
 });
 app.get('/tools', (_req, res) => res.json(allTools()));
 app.get('/policy', (_req, res) => res.json(policy.status(homes())));
-app.post('/unlock', express.json(), (req, res) => { const r = policy.unlock(req.body?.password); res.status(r.ok ? 200 : 401).json(r); });
-app.post('/lock', (_req, res) => res.json(policy.lock()));
+app.post('/unlock', express.json(), (req, res) => { const r = policy.unlock(req.body?.password); audit({ target: LOCAL, tool: 'unlock', args: '{"password":"***"}', ok: !!r.ok }); res.status(r.ok ? 200 : 401).json(r); });
+app.post('/lock', (_req, res) => { const r = policy.lock(); audit({ target: LOCAL, tool: 'lock', args: '{}', ok: true }); res.json(r); });
 app.get('/devices', (_req, res) => res.json({ hub: { name: LOCAL, platform: os.platform(), hostname: os.hostname(), home: HOME, tools: local.listTools().length + proxies.size },
   devices: [...devices.values()].map(d => ({ name: d.name, ...d.info, tools: d.tools.length, connectedAt: d.connectedAt })) }));
 app.post('/call', express.json({ limit: '150mb' }), async (req, res) => {

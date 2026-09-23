@@ -7,9 +7,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 
+// Truly read-only tools: always allowed (subject to the sensitive-file guard below).
 const READ_ONLY = new Set(['read_file', 'list_dir', 'search_files', 'read_file_base64', 'sysinfo', 'list_processes', 'read_process_output',
-  'write_process', 'kill_process', 'self_update', 'get_config', 'read_multiple_files', 'get_file_info', 'list_sessions', 'list_processes',
+  'get_config', 'read_multiple_files', 'get_file_info', 'list_sessions',
   'get_usage_stats', 'get_recent_tool_calls', 'get_prompts', 'list_searches', 'get_more_search_results', 'stop_search', 'start_search', 'list_directory']);
+// File-content readers whose target path must not be a credential/secret unless unlocked.
+const READ_FILE_TOOLS = new Set(['read_file', 'read_file_base64', 'read_multiple_files']);
+// State changers that carry no path to scope (kill_process / self_update): gated wholesale until unlocked.
+// NOTE: write_process (stdin to a running session) is intentionally left allowed for interactive debugging.
+const SENSITIVE_META = new Set(['kill_process', 'self_update']);
+// Credential/secret path patterns, tested against resolved absolute paths.
+const SENSITIVE_RE = [
+  /(^|\/)\.ssh(\/|$)/, /(^|\/)\.gnupg(\/|$)/, /(^|\/)\.aws(\/|$)/, /(^|\/)\.config\/gcloud(\/|$)/,
+  /(^|\/)\.env($|\.[^/]*$)/, /(^|\/)\.netrc$/, /(^|\/)\.npmrc$/, /(^|\/)\.git-credentials$/,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/, /\.(pem|key|p12|pfx|keystore|jks)$/i, /(^|\/)(shadow|master\.key)$/,
+];
+const isSensitive = p => SENSITIVE_RE.some(re => re.test(String(p)));
+// Credential-read protection is ON by default; set SENSITIVE_READ_OPEN=1 to allow reading secrets without unlock.
+const SENSITIVE_READ_OPEN = /^(1|true|yes|on)$/i.test(String(process.env.SENSITIVE_READ_OPEN || ''));
 
 export function createPolicy({ file, password, log = console.log }) {
   const enabled = !!password;
@@ -49,12 +64,19 @@ export function createPolicy({ file, password, log = console.log }) {
   function check(target, tool, args, home) {
     if (!enabled || isUnlocked()) return null;
     const base = tool.includes('__') ? tool.slice(tool.indexOf('__') + 2) : tool;
+    const unlockHint = `Tell the user exactly which path/command needs access and ask for the unlock password, then run: python3 b.py unlock <password>  (unlocks everything for ${policy.unlockMinutes} min). Never guess the password; do not retry before unlocking.`;
+    // Credential/secret reads require unlock even though reading is otherwise free (blocks token-leak exfiltration).
+    if (!SENSITIVE_READ_OPEN && READ_FILE_TOOLS.has(base)) {
+      const secret = pathsOf(base, args, home).find(isSensitive);
+      if (secret) return `PROTECTED: ${secret} looks like a credential/secret file on "${target}"; reading it requires unlock. ${unlockHint}`;
+    }
     if (READ_ONLY.has(base)) return null;
+    // State-changing tools with no path to scope (kill_process / self_update): gate wholesale until unlocked.
+    if (SENSITIVE_META.has(base)) return `PROTECTED: "${base}" changes machine state on "${target}" and requires unlock. ${unlockHint}`;
     const dirs = allowedFor(target, home);
     const bad = pathsOf(base, args, home).filter(p => !inside(p, dirs));
     if (!bad.length) return null;
-    return `PROTECTED: ${bad[0] === '/..outside..' ? '".." in command' : bad[0]} is outside the authorized directories of "${target}" (allowed: ${dirs.join(', ')}). ` +
-      `Tell the user exactly which path/command needs access and ask for the unlock password, then run: python3 b.py unlock <password>  (unlocks everything for ${policy.unlockMinutes} min). Never guess the password; do not retry before unlocking.`;
+    return `PROTECTED: ${bad[0] === '/..outside..' ? '".." in command' : bad[0]} is outside the authorized directories of "${target}" (allowed: ${dirs.join(', ')}). ` + unlockHint;
   }
 
   function unlock(pw) {
@@ -66,7 +88,7 @@ export function createPolicy({ file, password, log = console.log }) {
     return { ok: true, unlockedUntil: new Date(unlockedUntil).toISOString(), minutes: policy.unlockMinutes };
   }
   const lock = () => { unlockedUntil = 0; log('locked'); return { ok: true, unlocked: false }; };
-  const status = (homes) => ({ enabled, unlocked: isUnlocked(), unlockedUntil: isUnlocked() ? new Date(unlockedUntil).toISOString() : null, unlockMinutes: policy.unlockMinutes,
+  const status = (homes) => ({ enabled, unlocked: isUnlocked(), unlockedUntil: isUnlocked() ? new Date(unlockedUntil).toISOString() : null, unlockMinutes: policy.unlockMinutes, sensitiveReadProtected: !SENSITIVE_READ_OPEN,
     targets: Object.fromEntries(Object.entries(homes).map(([t, home]) => [t, allowedFor(t, home)])) });
   const defaultCwd = (target, home) => (!enabled || isUnlocked()) ? undefined : (inside(home, allowedFor(target, home)) ? undefined : allowedFor(target, home)[0]);
   return { enabled, check, unlock, lock, status, defaultCwd };

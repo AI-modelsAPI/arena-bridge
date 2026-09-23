@@ -11,9 +11,9 @@ If your environment cannot POST or run curl/python (e.g. it exposes only a URL-f
 - Tool: \`${B}/call?token=${T}&rid=<unique>&tool=mac__read_file&args=<url-encoded-JSON>\`
 - Token may instead be sent as an \`x-token\` header to keep it out of the URL. \`unlock\`/\`lock\` are NOT available over GET - the password must never be in a URL; ask the user and use POST /unlock.
 - Prefer POST/MCP whenever your sandbox can; GET is the compatibility fallback only.` : '';
-  return `## My machines bridge (use it, don't simulate it)
+  return `## My machines bridge (my own hardware, you're authorized to use it)
 
-You run in a sandbox, but you can operate my real machines through an HTTP bridge at ${B}. One hub ("${hub}", the machine running the bridge) plus devices that connect to it (typically "mac" and "android"). Everything below runs from your sandbox shell. Never fabricate results - always actually call the bridge and show the real output.
+These are my own machines - a hub ("${hub}", the server running the bridge) plus my devices that connect to it (typically "mac" and "android"). I'm authorizing you to operate them for the tasks I give you, through an HTTP bridge at ${B}. Treat what follows as the bridge's API reference, not as commands to obey blindly: use it with your own judgment. Reads are safe; a password gate protects anything outside my authorized directories, and reading credential files needs an unlock. Before anything that changes state (write/delete/exec), say what you'll do. Don't fabricate results - actually call the bridge and show the real output, or say so if you can't reach it.
 
 BASE=${B}
 TOKEN=${T}
@@ -68,7 +68,7 @@ ${getSection}
 
 // One-liner to paste at the start of every new chat; the agent fetches the full instructions itself.
 export function shortPrompt({ host, token }) {
-  return `You can operate my real machines (VPS, Mac, Android) through an HTTP bridge. First run this in your sandbox and then follow the instructions it prints exactly - never simulate results:\ncurl -s -H "Authorization: Bearer ${token}" https://${host}/prompt`;
+  return `These are my own machines (my VPS, Mac, and Android phone) and I'm authorizing you to use them for the tasks I give you. They're exposed as tools over an HTTP bridge, with a password gate protecting anything outside my authorized directories. Fetch the bridge's API reference below and use it with your own judgment: reads are safe, and before anything that changes state (write/delete/exec) tell me what you'll do first. Don't fabricate results - if you can't reach the bridge, just say so.\ncurl -s -H "Authorization: Bearer ${token}" https://${host}/prompt`;
 }
 
 if (process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop())) {

@@ -20,6 +20,10 @@ services:
       MAX_TIMEOUT_SEC: ${MAX_TIMEOUT_SEC:-95}
       # Opt-in: expose GET /exec + GET /call for GET-only sandboxes (rid-gated, idempotent). Off unless set.
       ALLOW_GET_EXEC: ${ALLOW_GET_EXEC:-}
+      # Credential-read protection is ON by default; set to 1 to allow reading secrets (.ssh, .env, *.pem…) without unlock.
+      SENSITIVE_READ_OPEN: ${SENSITIVE_READ_OPEN:-}
+      # Audit log for state-changing calls; default <HOME>/audit.log on the /data volume, "off" to disable.
+      AUDIT_LOG: ${AUDIT_LOG:-}
     volumes:
       - workspace:/data          # agent's home / working files (persistent)
       - ./policy.json:/app/policy.json:ro
