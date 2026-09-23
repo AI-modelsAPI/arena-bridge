@@ -49,6 +49,17 @@ curl -s -H "Authorization: Bearer <token>" https://bridge.example.com/install-de
 
 每个新对话开头贴第 1 步打印的那一行（`docker compose exec bridge node make-prompt.mjs --short` 可再打印）。agent 会自己从 `GET /prompt` 拉完整说明，并用 `python3 b.py devices` 查看在线设备。MCP 客户端填 `https://bridge.example.com/mcp` + Bearer token。
 
+## GET 兼容（可选，默认关）
+
+有些网页版 AI 的沙箱只能发 **GET**（唯一的外联工具是 URL 抓取器），即便到你域名的 TLS 是通的。设 `ALLOW_GET_EXEC=1` 后，`GET /exec`、`GET /call` 会在 POST 之外同时开放：
+
+```
+GET /exec?token=…&rid=<唯一值>&command=<url编码>[&device=mac&cwd=~&timeout_sec=90]
+GET /call?token=…&rid=<唯一值>&tool=mac__read_file&args=<url编码JSON>
+```
+
+每次请求必须带唯一 `rid`：GET 可能被平台预取或重试，桥对每个 `rid` 只执行一次、重复请求回放缓存结果——重复的 GET 绝不会执行两次。`HEAD` 被拒（405），查询串长度受限，响应 `no-store`，且 `unlock`/`lock` 不走 GET（密码绝不进 URL）。token 可改用 `x-token` 头传，避免出现在 URL 里。默认关闭；沙箱能用 POST/MCP 时优先用它。
+
 ## 密码层
 
 `policy.json` 为每台机器列出授权目录。agent 遇到 `PROTECTED` 会告诉你它想改哪个路径、在哪台机器，并向你要密码；你把密码告诉它，它执行 `python3 b.py unlock <密码>`，默认解锁 15 分钟，`lock` 立即上锁。密码只存在服务器 `.env`，不出现在提示词里。

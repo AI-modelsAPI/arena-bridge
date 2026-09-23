@@ -61,6 +61,17 @@ Paste the one-liner from step 1 at the start of a new chat (`docker compose exec
 | `POST /mcp` | MCP Streamable HTTP (stateless) |
 | `GET /prompt` · `/client.py` · `/install-device.sh` | helpers with the URL/token baked in |
 
+### GET compatibility (opt-in)
+
+Some web-AI sandboxes can only issue **GET** (their only outbound tool is a URL fetcher), even though TLS to your host works. Set `ALLOW_GET_EXEC=1` to expose `GET /exec` and `GET /call` **in addition to** POST:
+
+```
+GET /exec?token=…&rid=<unique>&command=<url-encoded>[&device=mac&cwd=~&timeout_sec=90]
+GET /call?token=…&rid=<unique>&tool=mac__read_file&args=<url-encoded-JSON>
+```
+
+Each request must carry a unique `rid`: a GET can be prefetched or retried by the platform, so the bridge runs each `rid` at most once and replays the cached result for repeats — a duplicated GET never executes twice. `HEAD` is refused (405), the query string is length-capped, responses are `no-store`, and `unlock`/`lock` are **not** available over GET (the password must never travel in a URL). Token may ride in an `x-token` header instead of the query. It stays off by default; prefer POST/MCP whenever the sandbox can.
+
 ## Security notes
 
 * The token is a shell on every attached machine; treat it like a root password. Rotate: edit `.env`, `docker compose up -d`, re-run the device install lines.

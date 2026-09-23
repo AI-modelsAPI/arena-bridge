@@ -35,6 +35,12 @@ const HOSTNAME = process.env.BRIDGE_HOST || config.hostname;
 const LOCAL = (process.env.LOCAL_NAME || config.localName || 'hub').toLowerCase();
 const HOME = os.homedir();
 const DEVICE_CALL_TIMEOUT = Number(process.env.DEVICE_CALL_TIMEOUT_SEC || 1800) * 1000;
+// Opt-in GET compatibility: some web-AI sandboxes can only issue GET (their fetch/prefetch tool),
+// even though the bridge normally uses POST. OFF by default; enable with ALLOW_GET_EXEC=1.
+const ALLOW_GET_EXEC = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_GET_EXEC || ''));
+const MAX_GET_QUERY = Number(process.env.MAX_GET_QUERY_CHARS || 4096);
+const GET_DEDUP_TTL = Number(process.env.GET_DEDUP_TTL_SEC || 300) * 1000;
+const GET_DEDUP_MAX = Number(process.env.GET_DEDUP_MAX || 500);
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 const local = createBuiltins({ defaultTimeoutSec: Number(process.env.DEFAULT_TIMEOUT_SEC || config.defaultTimeoutSec || 90), maxTimeoutSec: Number(process.env.MAX_TIMEOUT_SEC || 95), maxOutputChars: config.maxOutputChars });
@@ -135,6 +141,28 @@ async function callTool(name, args = {}) {
 }
 const flatten = res => ({ ok: !res.isError, isError: !!res.isError, text: (res.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n'), content: res.content });
 
+// ---------- GET-compat idempotency (prefetch/retry safety) ----------
+// A GET can be replayed by the platform's fetcher (speculative prefetch, retry, double-open).
+// Each GET exec/call MUST carry a caller-chosen unique rid; we run it at most once and replay the
+// cached result for repeats within a TTL, so a retried GET never executes a command twice.
+const getResults = new Map(); // rid -> { promise, at }
+function sweepDedup() {
+  const now = Date.now();
+  for (const [k, v] of getResults) if (now - v.at > GET_DEDUP_TTL) getResults.delete(k);
+  if (getResults.size > GET_DEDUP_MAX) { const excess = getResults.size - GET_DEDUP_MAX; let i = 0; for (const k of getResults.keys()) { if (i++ >= excess) break; getResults.delete(k); } }
+}
+// Returns { hit, result }. The producer runs at most once per rid even under concurrent duplicates.
+function dedupe(rid, producer) {
+  sweepDedup();
+  const existing = getResults.get(rid);
+  if (existing) return existing.promise.then(result => ({ hit: true, result }));
+  const promise = Promise.resolve().then(producer);
+  getResults.set(rid, { promise, at: Date.now() });
+  promise.catch(() => getResults.delete(rid)); // don't cache thrown errors; allow a genuine retry
+  return promise.then(result => ({ hit: false, result }));
+}
+const META_TOOL_NAMES = new Set(META_TOOLS.map(t => t.name));
+
 // ---------- HTTP ----------
 const app = express();
 app.set('trust proxy', true); app.disable('x-powered-by');
@@ -165,6 +193,54 @@ app.post('/exec', express.json({ limit: '50mb' }), async (req, res) => {
   if (r.isError) return res.status(400).json({ error: flatten(r).text });
   try { res.json(JSON.parse(flatten(r).text)); } catch { res.json(flatten(r)); }
 });
+
+// ---------- GET compatibility (opt-in via ALLOW_GET_EXEC=1) ----------
+// For sandboxes whose only outbound tool is a GET fetcher. Parameters ride in the query string.
+// Guard rails: caller-chosen unique `rid` (idempotent replay), query-length cap, HEAD refused
+// (no side effects on a metadata probe), no-store, and unlock/lock never accepted over GET
+// (the password must never travel in a URL). Auth is the same middleware as every other route.
+if (ALLOW_GET_EXEC) {
+  const guard = (req, res) => {
+    if (req.method === 'HEAD') { res.set('Allow', 'GET'); res.status(405).json({ error: 'HEAD not allowed: GET here executes a command and must not run on a metadata probe' }); return false; }
+    const qlen = (req.originalUrl.split('?')[1] || '').length;
+    if (qlen > MAX_GET_QUERY) { res.status(413).json({ error: `query too long (${qlen} > ${MAX_GET_QUERY} chars); use POST /exec or /call for large payloads` }); return false; }
+    if (!req.query.rid || typeof req.query.rid !== 'string') { res.status(400).json({ error: 'rid required: pass a unique rid=<id> per request so a retried/prefetched GET is not executed twice' }); return false; }
+    res.set('Cache-Control', 'no-store');
+    return true;
+  };
+  app.get('/exec', async (req, res) => {
+    if (!guard(req, res)) return;
+    const { rid, command, cwd, timeout_sec, device } = req.query;
+    if (!command) return res.status(400).json({ error: 'command required' });
+    const target = device || LOCAL;
+    log(`GET exec@${target} rid=${String(rid).slice(0, 40)} ${String(command).slice(0, 120)}`);
+    try {
+      const { hit, result } = await dedupe(`exec:${rid}`, async () => {
+        const r = await callTool(`${target}__bash`, { command, cwd, timeout_sec: timeout_sec ? Number(timeout_sec) : undefined });
+        if (r.isError) return { status: 400, body: { error: flatten(r).text } };
+        let body; try { body = JSON.parse(flatten(r).text); } catch { body = flatten(r); }
+        return { status: 200, body };
+      });
+      res.set('X-Bridge-Dedup', hit ? 'hit' : 'miss').status(result.status).json(result.body);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+  app.head('/exec', (req, res) => guard(req, res));
+  app.get('/call', async (req, res) => {
+    if (!guard(req, res)) return;
+    const { rid, tool } = req.query;
+    if (!tool) return res.status(400).json({ error: 'tool required' });
+    if (META_TOOL_NAMES.has(tool)) return res.status(400).json({ error: `"${tool}" is not allowed over GET; use POST /call or /unlock so a password never appears in a URL or proxy log` });
+    let args = {};
+    if (req.query.args != null) { try { args = JSON.parse(req.query.args); } catch { return res.status(400).json({ error: 'args must be URL-encoded JSON' }); } }
+    log(`GET call rid=${String(rid).slice(0, 40)} ${String(tool).slice(0, 80)}`);
+    try {
+      const { hit, result } = await dedupe(`call:${rid}`, async () => flatten(await callTool(tool, args)));
+      res.set('X-Bridge-Dedup', hit ? 'hit' : 'miss').json(result);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+  app.head('/call', (req, res) => guard(req, res));
+  log('ALLOW_GET_EXEC=1: GET /exec and GET /call are enabled (idempotent, rid-gated)');
+}
 app.use('/files', express.raw({ type: () => true, limit: '2gb' }), async (req, res) => {
   const raw = decodeURIComponent(req.path.replace(/^\//, ''));
   const m = raw.match(/^@([^/]+)\/(.*)$/);
@@ -186,7 +262,7 @@ app.use('/files', express.raw({ type: () => true, limit: '2gb' }), async (req, r
 });
 const base = req => process.env.PUBLIC_URL || (HOSTNAME && !/example\.com$/.test(HOSTNAME) ? `https://${HOSTNAME}` : `${req.protocol}://${req.get('host')}`);
 app.get('/client.py', (req, res) => res.type('text/x-python').send(clientPy(base(req))));
-app.get('/prompt', (req, res) => res.type('text/markdown').send(buildPrompt({ base: base(req), token: TOKEN, hub: LOCAL, timeout: local.DEFAULT_TIMEOUT, maxTimeout: local.MAX_TIMEOUT })));
+app.get('/prompt', (req, res) => res.type('text/markdown').send(buildPrompt({ base: base(req), token: TOKEN, hub: LOCAL, timeout: local.DEFAULT_TIMEOUT, maxTimeout: local.MAX_TIMEOUT, getFallback: ALLOW_GET_EXEC })));
 app.get('/install-device.sh', (req, res) => res.type('text/x-shellscript').send(installSh(base(req))));
 app.get('/device-agent.mjs', (_req, res) => res.type('text/javascript').sendFile(path.join(ROOT, 'device-agent.mjs')));
 app.get('/builtins.mjs', (_req, res) => res.type('text/javascript').sendFile(path.join(ROOT, 'builtins.mjs')));

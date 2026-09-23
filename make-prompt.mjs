@@ -1,8 +1,16 @@
 // Prompt templates. CLI: node make-prompt.mjs [--short]   (also imported by server.mjs for GET /prompt)
 import fs from 'node:fs';
 
-export function buildPrompt({ host, token: T, hub, base, timeout = 90, maxTimeout = 95 }) {
+export function buildPrompt({ host, token: T, hub, base, timeout = 90, maxTimeout = 95, getFallback = false }) {
   const B = base || `https://${host}`;
+  const getSection = getFallback ? `
+
+### GET fallback (only if your sandbox can ONLY make GET requests)
+If your environment cannot POST or run curl/python (e.g. it exposes only a URL-fetch/GET tool), the same two actions are reachable by GET. You MUST send a fresh unique \`rid\` (any random id) on every request - a GET may be prefetched or retried by the platform, and the bridge runs each rid at most once and replays the cached result for repeats, so a duplicated GET never executes twice.
+- Exec: \`${B}/exec?token=${T}&rid=<unique>&command=<url-encoded>\` (optional \`&device=mac\`, \`&cwd=~\`, \`&timeout_sec=90\`)
+- Tool: \`${B}/call?token=${T}&rid=<unique>&tool=mac__read_file&args=<url-encoded-JSON>\`
+- Token may instead be sent as an \`x-token\` header to keep it out of the URL. \`unlock\`/\`lock\` are NOT available over GET - the password must never be in a URL; ask the user and use POST /unlock.
+- Prefer POST/MCP whenever your sandbox can; GET is the compatibility fallback only.` : '';
   return `## My machines bridge (use it, don't simulate it)
 
 You run in a sandbox, but you can operate my real machines through an HTTP bridge at ${B}. One hub ("${hub}", the machine running the bridge) plus devices that connect to it (typically "mac" and "android"). Everything below runs from your sandbox shell. Never fabricate results - always actually call the bridge and show the real output.
@@ -47,7 +55,7 @@ Each machine has authorized directories (see \`python3 b.py policy\`). Reading a
 
 ### Raw HTTP (if python is unavailable)
 POST ${B}/exec {"device":"mac","command":"...","cwd":"~","timeout_sec":120} | POST ${B}/call {"tool":"mac__read_file","args":{...}} | GET/PUT ${B}/files/@mac/<path> | GET ${B}/devices | MCP endpoint: POST ${B}/mcp. Header: Authorization: Bearer ${T}
-
+${getSection}
 ### Rules
 1. Check \`devices\` first; a device that is offline simply has no tools - say so instead of guessing.
 2. Every single call must finish within ${timeout}s (hard limit ${maxTimeout}s - the connection is cut beyond that). For anything longer use <target>__start_process, then poll <target>__read_process_output (each poll is a short call). Interactive programs: write_process to send input.
@@ -66,7 +74,7 @@ export function shortPrompt({ host, token }) {
 if (process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop())) {
   const cfgUrl = ['./config.json', './config.example.json'].map(f => new URL(f, import.meta.url)).find(u => fs.existsSync(u));
   const c = JSON.parse(fs.readFileSync(cfgUrl, 'utf8'));
-  const opts = { host: process.env.BRIDGE_HOST || c.hostname, token: process.env.BRIDGE_TOKEN || c.token, hub: (process.env.LOCAL_NAME || c.localName || 'hub').toLowerCase() };
+  const opts = { host: process.env.BRIDGE_HOST || c.hostname, token: process.env.BRIDGE_TOKEN || c.token, hub: (process.env.LOCAL_NAME || c.localName || 'hub').toLowerCase(), getFallback: /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_GET_EXEC || '')) };
   if (process.argv.includes('--short')) { process.stdout.write(shortPrompt(opts) + '\n'); }
   else {
     const p = buildPrompt(opts);
