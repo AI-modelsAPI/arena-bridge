@@ -1,95 +1,120 @@
-// Directory policy + password unlock. Enforced centrally on the hub for every target (hub, proxied MCP, devices).
-// - Read-only tools are always allowed.
-// - Mutating tools (write/edit/delete/bash/start_process/...) touching a path outside the target's allowed
-//   directories return a PROTECTED error until the hub is unlocked with the password (time-limited).
-// - bash/start_process checks are heuristic: cwd + every path-looking token in the command; ".." always counts as outside.
+// Defense-in-depth policy. Arbitrary execution is NEVER allowed while locked.
+// Filesystem confinement also needs OS-level separation to resist a malicious agent.
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { timingSafeEqual } from 'node:crypto';
+import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 
-// Truly read-only tools: always allowed (subject to the sensitive-file guard below).
-const READ_ONLY = new Set(['read_file', 'list_dir', 'search_files', 'read_file_base64', 'sysinfo', 'list_processes', 'read_process_output',
-  'get_config', 'read_multiple_files', 'get_file_info', 'list_sessions',
-  'get_usage_stats', 'get_recent_tool_calls', 'get_prompts', 'list_searches', 'get_more_search_results', 'stop_search', 'start_search', 'list_directory']);
-// File-content readers whose target path must not be a credential/secret unless unlocked.
-const READ_FILE_TOOLS = new Set(['read_file', 'read_file_base64', 'read_multiple_files']);
-// State changers that carry no path to scope (kill_process / self_update): gated wholesale until unlocked.
-// NOTE: write_process (stdin to a running session) is intentionally left allowed for interactive debugging.
-const SENSITIVE_META = new Set(['kill_process', 'self_update']);
-// Credential/secret path patterns, tested against resolved absolute paths.
-const SENSITIVE_RE = [
-  /(^|\/)\.ssh(\/|$)/, /(^|\/)\.gnupg(\/|$)/, /(^|\/)\.aws(\/|$)/, /(^|\/)\.config\/gcloud(\/|$)/,
-  /(^|\/)\.env($|\.[^/]*$)/, /(^|\/)\.netrc$/, /(^|\/)\.npmrc$/, /(^|\/)\.git-credentials$/,
-  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/, /\.(pem|key|p12|pfx|keystore|jks)$/i, /(^|\/)(shadow|master\.key)$/,
+const EXECUTION = new Set(['bash', 'start_process', 'write_process', 'kill_process', 'self_update', 'read_process_output', 'list_processes', 'delete_path']);
+const SCOPED_WRITES = new Set(['write_file', 'edit_file', 'write_file_base64']);
+const SCOPED_READS = new Set(['read_file', 'read_file_base64', 'list_dir']);
+const SECRET_PATTERNS = [
+  /(^|\/)audit\.log$/, /(^|\/)\.arena-device(\/|$)/, /(^|\/)\.ssh(\/|$)/, /(^|\/)\.gnupg(\/|$)/, /(^|\/)\.aws(\/|$)/,
+  /(^|\/)\.config\/gcloud(\/|$)/, /(^|\/)\.env($|\.[^/]*$)/,
+  /(^|\/)\.netrc$/, /(^|\/)\.npmrc$/, /(^|\/)\.git-credentials$/,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/, /\.(pem|key|p12|pfx|keystore|jks)$/i,
+  /(^|\/)(shadow|master\.key)$/,
 ];
-const isSensitive = p => SENSITIVE_RE.some(re => re.test(String(p)));
-// Credential-read protection is ON by default; set SENSITIVE_READ_OPEN=1 to allow reading secrets without unlock.
-const SENSITIVE_READ_OPEN = /^(1|true|yes|on)$/i.test(String(process.env.SENSITIVE_READ_OPEN || ''));
+const isSecret = p => SECRET_PATTERNS.some(re => re.test(p));
 
-export function createPolicy({ file, password, log = console.log }) {
-  const enabled = !!password;
-  let policy = { unlockMinutes: 15, targets: { '*': { allow: ['~'] } } };
-  try { if (file && fs.existsSync(file)) policy = { ...policy, ...JSON.parse(fs.readFileSync(file, 'utf8')) }; } catch (e) { log(`policy.json invalid: ${e.message}`); }
+export function hashPassword(password) {
+  if (typeof password !== 'string' || password.length < 16) throw new Error('unlock password must contain at least 16 characters');
+  const salt = randomBytes(32);
+  return `scrypt$${salt.toString('hex')}$${scryptSync(password, salt, 32, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }).toString('hex')}`;
+}
+function verifyHash(password, encoded) {
+  const m = /^scrypt\$([0-9a-f]{64})\$([0-9a-f]{64})$/.exec(encoded || '');
+  if (!m) throw new Error('invalid UNLOCK_PASSWORD_HASH; expected scrypt$<64 hex salt>$<64 hex digest>');
+  const actual = scryptSync(String(password || ''), Buffer.from(m[1], 'hex'), 32, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+  return timingSafeEqual(actual, Buffer.from(m[2], 'hex'));
+}
+
+export const normalizePath = (value, home) => {
+  if (typeof value !== 'string' || value.includes('\0')) throw new Error('invalid path');
+  let p = value.replace(/^\$HOME(?=\/|$)/, '~');
+  if (!p || p === '~') return path.posix.normalize(home);
+  if (p.startsWith('~/')) return path.posix.resolve(home, p.slice(2));
+  return path.posix.resolve(home, p);
+};
+const inside = (p, dirs) => dirs.some(d => p === d || p.startsWith(d.endsWith('/') ? d : d + '/'));
+
+// Resolve even a yet-to-be-created target, including a dangling symlink in the path.
+// This is defense in depth, not atomic confinement against races; use OS isolation for that.
+export async function canonicalPath(value) {
+  let current = value, tail = [], hops = 0;
+  for (;;) {
+    if (++hops > 128) throw new Error('path resolution exceeded maximum depth');
+    try {
+      return path.posix.resolve(await fsp.realpath(current), ...tail.reverse());
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      const st = await fsp.lstat(current).catch(err => { if (err.code === 'ENOENT') return null; throw err; });
+      if (st?.isSymbolicLink()) {
+        current = path.posix.resolve(path.posix.dirname(current), await fsp.readlink(current));
+        continue;
+      }
+      const parent = path.posix.dirname(current);
+      if (parent === current) throw e;
+      tail.push(path.posix.basename(current));
+      current = parent;
+    }
+  }
+}
+
+// Also run this check on the device itself: the hub cannot resolve symlinks on a remote filesystem.
+export async function checkToolAccess({ tool, args = {}, home, allowedDirs, unlocked = false, canonical = true }) {
+  if (unlocked) return null;
+  const denied = reason => `PROTECTED: ${reason}; request unlock for this operation`;
+  const name = tool.includes('__') ? tool.slice(tool.indexOf('__') + 2) : tool;
+  // Third-party MCP tools are not safely classified by name or arbitrary schemas.
+  if (tool.startsWith('dc__')) return denied('proxied MCP tools require unlock');
+  if (EXECUTION.has(name) || name === 'search_files') return denied(`${name} requires unlock`);
+  if (name === 'sysinfo') return null;
+  if (!SCOPED_READS.has(name) && !SCOPED_WRITES.has(name)) return denied(`unknown tool ${name}`);
+  const p = args.path ?? (name === 'list_dir' ? '~' : undefined);
+  if (typeof p !== 'string') return denied('a valid path is required');
+  try {
+    const requested = normalizePath(p, home);
+    const resolved = canonical ? await canonicalPath(requested) : requested;
+    const dirs = canonical ? await Promise.all(allowedDirs.map(canonicalPath)) : allowedDirs;
+    if (!inside(resolved, dirs)) return denied(`${resolved} is outside authorized directories`);
+    if (name !== 'list_dir' && (isSecret(requested) || isSecret(resolved))) return denied(`${resolved} looks like a credential`);
+    return null;
+  } catch (e) { return denied(`cannot verify path: ${e.message}`); }
+}
+
+export function createPolicy({ file, passwordHash, disabled = false, log = console.log }) {
+  if (!disabled) verifyHash('', passwordHash); // validate at startup; fail closed
+  let settings = { unlockMinutes: 15, targets: { '*': { allow: ['~'] } } };
+  if (file) {
+    try { settings = { ...settings, ...JSON.parse(fs.readFileSync(file, 'utf8')) }; }
+    catch (e) { throw new Error(`policy file missing or invalid: ${e.message}`); }
+  }
+  if (!Number.isInteger(settings.unlockMinutes) || settings.unlockMinutes < 1 || settings.unlockMinutes > 60) throw new Error('unlockMinutes must be between 1 and 60');
   let unlockedUntil = 0, failures = 0, lockoutUntil = 0;
-
-  const norm = (p, home) => {
-    if (!p) return home;
-    p = String(p).replace(/^\$HOME(?=\/|$)/, '~').replace(/^"|"$/g, '').replace(/^'|'$/g, '');
-    if (p === '~') return home;
-    if (p.startsWith('~/')) return path.posix.join(home, p.slice(2));
-    if (!p.startsWith('/')) return path.posix.join(home, p);
-    return path.posix.normalize(p);
-  };
+  const isUnlocked = () => !disabled && Date.now() < unlockedUntil;
   const allowedFor = (target, home) => {
-    const t = policy.targets?.[target] || policy.targets?.['*'] || { allow: ['~'] };
-    return (t.allow || []).map(a => norm(a, home));
+    const t = settings.targets?.[target] || settings.targets?.['*'];
+    if (!t || !Array.isArray(t.allow) || !t.allow.length) throw new Error(`no allowed directories configured for ${target}`);
+    return t.allow.map(p => normalizePath(p, home));
   };
-  const inside = (p, dirs) => dirs.some(d => p === d || p.startsWith(d.endsWith('/') ? d : d + '/'));
-  const isUnlocked = () => Date.now() < unlockedUntil;
-
-  // Collect the paths a call would touch.
-  function pathsOf(tool, args = {}, home) {
-    const out = [];
-    for (const k of ['path', 'cwd', 'source', 'destination', 'file_path', 'directory']) if (typeof args[k] === 'string') out.push(norm(args[k], home));
-    if (Array.isArray(args.paths)) for (const p of args.paths) out.push(norm(p, home));
-    if (tool === 'bash' || tool === 'start_process') {
-      if (!args.cwd) out.push(home);
-      const cmd = String(args.command || '');
-      if (/(^|[\s/])\.\.(\/|\s|$)/.test(cmd)) out.push('/..outside..'); // any ".." escapes -> protected
-      for (const m of cmd.matchAll(/(?:^|[\s=:'"(])((?:~|\$HOME|\/)[^\s'"()|;&<>]*)/g)) out.push(norm(m[1], home));
-    }
-    return out;
-  }
-
-  function check(target, tool, args, home) {
-    if (!enabled || isUnlocked()) return null;
-    const base = tool.includes('__') ? tool.slice(tool.indexOf('__') + 2) : tool;
-    const unlockHint = `Tell the user exactly which path/command needs access and ask for the unlock password, then run: python3 b.py unlock <password>  (unlocks everything for ${policy.unlockMinutes} min). Never guess the password; do not retry before unlocking.`;
-    // Credential/secret reads require unlock even though reading is otherwise free (blocks token-leak exfiltration).
-    if (!SENSITIVE_READ_OPEN && READ_FILE_TOOLS.has(base)) {
-      const secret = pathsOf(base, args, home).find(isSensitive);
-      if (secret) return `PROTECTED: ${secret} looks like a credential/secret file on "${target}"; reading it requires unlock. ${unlockHint}`;
-    }
-    if (READ_ONLY.has(base)) return null;
-    // State-changing tools with no path to scope (kill_process / self_update): gate wholesale until unlocked.
-    if (SENSITIVE_META.has(base)) return `PROTECTED: "${base}" changes machine state on "${target}" and requires unlock. ${unlockHint}`;
-    const dirs = allowedFor(target, home);
-    const bad = pathsOf(base, args, home).filter(p => !inside(p, dirs));
-    if (!bad.length) return null;
-    return `PROTECTED: ${bad[0] === '/..outside..' ? '".." in command' : bad[0]} is outside the authorized directories of "${target}" (allowed: ${dirs.join(', ')}). ` + unlockHint;
-  }
-
-  function unlock(pw) {
-    if (!enabled) return { ok: false, error: 'no UNLOCK_PASSWORD configured; policy disabled' };
+  const check = (target, tool, args, home, { canonical = true } = {}) =>
+    disabled ? Promise.resolve(null) : checkToolAccess({ tool, args, home, allowedDirs: allowedFor(target, home), unlocked: isUnlocked(), canonical });
+  const unlock = pw => {
+    if (disabled) return { ok: false, error: 'directory policy explicitly disabled' };
     if (Date.now() < lockoutUntil) return { ok: false, error: `too many failures, retry in ${Math.ceil((lockoutUntil - Date.now()) / 1000)}s` };
-    const a = Buffer.from(String(pw || '')), b = Buffer.from(password);
-    if (a.length !== b.length || !timingSafeEqual(a, b)) { failures++; if (failures >= 5) { lockoutUntil = Date.now() + 60_000; failures = 0; } log('unlock: wrong password'); return { ok: false, error: 'wrong password' }; }
-    failures = 0; unlockedUntil = Date.now() + policy.unlockMinutes * 60_000; log(`unlocked for ${policy.unlockMinutes} min`);
-    return { ok: true, unlockedUntil: new Date(unlockedUntil).toISOString(), minutes: policy.unlockMinutes };
-  }
+    if (!verifyHash(pw, passwordHash)) {
+      failures++;
+      if (failures >= 5) { lockoutUntil = Date.now() + 60_000; failures = 0; }
+      log('unlock: wrong password');
+      return { ok: false, error: 'wrong password' };
+    }
+    failures = 0; unlockedUntil = Date.now() + settings.unlockMinutes * 60_000;
+    log(`unlocked for ${settings.unlockMinutes} min`);
+    return { ok: true, unlockedUntil: new Date(unlockedUntil).toISOString(), minutes: settings.unlockMinutes };
+  };
   const lock = () => { unlockedUntil = 0; log('locked'); return { ok: true, unlocked: false }; };
-  const status = (homes) => ({ enabled, unlocked: isUnlocked(), unlockedUntil: isUnlocked() ? new Date(unlockedUntil).toISOString() : null, unlockMinutes: policy.unlockMinutes, sensitiveReadProtected: !SENSITIVE_READ_OPEN,
+  const status = homes => ({ enabled: !disabled, unlocked: isUnlocked(), unlockedUntil: isUnlocked() ? new Date(unlockedUntil).toISOString() : null, unlockMinutes: settings.unlockMinutes,
     targets: Object.fromEntries(Object.entries(homes).map(([t, home]) => [t, allowedFor(t, home)])) });
-  const defaultCwd = (target, home) => (!enabled || isUnlocked()) ? undefined : (inside(home, allowedFor(target, home)) ? undefined : allowedFor(target, home)[0]);
-  return { enabled, check, unlock, lock, status, defaultCwd };
+  return { enabled: !disabled, check, unlock, lock, status, allowedFor, isUnlocked };
 }

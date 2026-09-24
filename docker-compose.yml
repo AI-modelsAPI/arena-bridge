@@ -14,14 +14,12 @@ services:
       BRIDGE_HOST: ${BRIDGE_HOST:?set BRIDGE_HOST in .env}
       TZ: ${TZ:-Asia/Shanghai}
       LOCAL_NAME: ${LOCAL_NAME:-vps}
-      UNLOCK_PASSWORD: ${UNLOCK_PASSWORD:-}
+      UNLOCK_PASSWORD_HASH: ${UNLOCK_PASSWORD_HASH:-}
+      DEVICE_TOKENS_JSON: ${DEVICE_TOKENS_JSON:?set device tokens in .env}
+      DISABLE_POLICY: ${DISABLE_POLICY:-}
       # Behind Cloudflare proxy (orange cloud) requests are cut at 100s -> keep single calls under that.
       DEFAULT_TIMEOUT_SEC: ${DEFAULT_TIMEOUT_SEC:-90}
       MAX_TIMEOUT_SEC: ${MAX_TIMEOUT_SEC:-95}
-      # Opt-in: expose GET /exec + GET /call for GET-only sandboxes (rid-gated, idempotent). Off unless set.
-      ALLOW_GET_EXEC: ${ALLOW_GET_EXEC:-}
-      # Credential-read protection is ON by default; set to 1 to allow reading secrets (.ssh, .env, *.pem…) without unlock.
-      SENSITIVE_READ_OPEN: ${SENSITIVE_READ_OPEN:-}
       # Audit log for state-changing calls; default <HOME>/audit.log on the /data volume, "off" to disable.
       AUDIT_LOG: ${AUDIT_LOG:-}
     volumes:
@@ -29,6 +27,9 @@ services:
       - ./policy.json:/app/policy.json:ro
     # Uncomment to let the agent control the VPS's Docker (powerful, dangerous):
     #   - /var/run/docker.sock:/var/run/docker.sock
+    mem_limit: 512m
+    pids_limit: 256
+    security_opt: ["no-new-privileges:true"]
     # Default: bind to localhost only; put your own nginx/Caddy/cloudflared in front (see nginx/ dir).
     # To use the bundled Caddy instead:  docker compose --profile caddy up -d
     ports: ["127.0.0.1:${BRIDGE_PORT:-3777}:3777"]

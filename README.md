@@ -1,92 +1,53 @@
-# arena-bridge
+# arena-bridge (security-hardened)
 
-Give a web-based AI agent (arena.ai Agent Mode, or any MCP client such as Claude Desktop / Cursor) hands on **your real machines**: a VPS, your Mac/Linux box and your Android phone — through **one URL and one token**, with a **password gate** for anything outside the directories you authorize.
+Expose tools on **your own, authorized** VPS, Mac/Linux and Android Termux devices to a web AI agent through one hub. The main `BRIDGE_TOKEN` is effectively a remote-shell credential: never publish it or send it to untrusted services.
 
-```
-arena.ai / Claude ──► https://bridge.example.com  (hub: Docker on a VPS, standard MCP endpoint /mcp)
-   sandbox curl                 │
-                                ├── vps__*      the hub container itself
-                                ├── mac__*      ◄── your computer   (device agent dials OUT, no port forwarding)
-                                └── android__*  ◄── your phone      (Termux)
-```
+> **Breaking migration from v0.2:** plaintext `UNLOCK_PASSWORD`, shared device/agent tokens, and state-changing `GET /exec`/`GET /call` are no longer supported. Do not redeploy production by just pulling `main`: configure a password hash and per-device credentials and reinstall device agents first.
 
-* Same 15 tools on every machine: `bash`, `read_file`, `write_file`, `edit_file`, `list_dir`, `search_files`, `delete_path`, binary `get`/`put`, `sysinfo`, and process sessions (`start_process` / `read_process_output` / `write_process` / `kill_process`) for long-running or interactive jobs.
-* Reads are always allowed; **writes/commands outside the authorized directories return `PROTECTED`** until the agent asks *you* for the unlock password (time-limited unlock).
-* Devices reconnect automatically and can self-update from the hub.
-* Nothing to install in the browser or on the phone you chat from. Works from mobile.
+## Permission model
 
-## Requirements
+The AI client authenticates with `Authorization: Bearer <BRIDGE_TOKEN>`. Each device authenticates separately to the WebSocket endpoint using its own token in a subprotocol header, not in the URL. Device credentials cannot call AI-facing shell/file/MCP endpoints.
 
-| Where | Needs |
-|---|---|
-| Server (hub) | Linux VPS with a public IP, a DNS `A` record for your hostname. Docker is installed by the script if missing. |
-| Your computer | Node.js ≥ 22 (`brew install node` / your package manager) |
-| Android | [Termux](https://github.com/termux/termux-app/releases) (F-Droid/GitHub build, not Play Store) |
+While locked: non-sensitive file reads and directory listings inside authorized directories, plus system info, are available. Credential reads, content searches, recursive deletes, arbitrary shell execution, process sessions, process control, self-update and third-party MCP tools require unlock. All scoped file operations are checked against canonical (symlink-resolved) authorized directories. The unlock defaults to 15 minutes. **The policy is defense in depth, not a security sandbox:** an unlocked process can access everything its OS user can access and can outlive an unlock. Use OS/container isolation for untrusted agents. Desktop Commander is no longer installed/enabled by default.
 
-## Install
+## New installation
 
-**1. Server**
+1. Provide a VPS/domain and Docker. Use Node.js >=22 on a trusted machine to generate the password hash.
+2. Copy `.env.example` to `.env`. Generate `BRIDGE_TOKEN` and **different** tokens for each registered device with `openssl rand -hex 24`; fill `BRIDGE_HOST` and `DEVICE_TOKENS_JSON`.
+3. On a trusted Bash terminal, create a hash without putting the password in argv or a tracked file:
 
-```bash
-git clone https://github.com/AI-modelsAPI/arena-bridge && cd arena-bridge
-cp .env.example .env            # set BRIDGE_HOST, BRIDGE_TOKEN (openssl rand -hex 24), UNLOCK_PASSWORD
-sudo bash deploy-vps.sh         # Docker + HTTPS (bundled Caddy, or reuses an existing nginx) + prints the prompt line
-```
-Edit `policy.json` to choose which directories each machine may be modified in without a password (`docker compose restart` after changes).
+   ```bash
+   read -rsp 'Unlock password (16+ chars): ' PW; echo
+   printf '%s' "$PW" | node scripts/hash-password.mjs
+   unset PW
+   ```
 
-**2. Devices** — run on each machine you want the agent to control (commands are printed by step 1):
+   Put the output into `.env` as `UNLOCK_PASSWORD_HASH='scrypt$...$...'`. Delete the old `UNLOCK_PASSWORD` line. Run `chmod 600 .env`.
+4. Deploy with `sudo bash deploy-vps.sh`. The container now runs as UID 1000 rather than root; existing `/data` volumes may require an administrator to change their ownership to UID/GID 1000 before startup. Back up the volume before migration; do not use world-writable permissions as a workaround.
+5. Reinstall every device with the new **named** installer URL, replacing the example host. A main token authorizes installer retrieval, but only the scoped device token is stored locally:
 
-```bash
-# Mac / Linux
-curl -s -H "Authorization: Bearer <token>" https://bridge.example.com/install-device.sh | sh -s mac "My laptop"
-# Android (inside Termux)
-pkg install -y nodejs-lts curl && termux-setup-storage && \
-curl -s -H "Authorization: Bearer <token>" https://bridge.example.com/install-device.sh | sh -s android "My phone"
-```
-Installs to `~/.arena-device/`, auto-starts (launchd / systemd / Termux:Boot). On Android keep Termux's wake lock on and exclude it from battery optimisation.
+   ```bash
+   # Mac/Linux: Node >=22, BRIDGE_TOKEN already set in your private shell
+   curl -fsS -H "Authorization: Bearer $BRIDGE_TOKEN" 'https://bridge.example.com/install-device.sh?name=mac' | sh -s mac 'My laptop'
+   # Android Termux: install nodejs-lts and curl first
+   curl -fsS -H "Authorization: Bearer $BRIDGE_TOKEN" 'https://bridge.example.com/install-device.sh?name=android' | sh -s android 'My phone'
+   ```
 
-**3. Use**
+   Review downloaded scripts if you prefer; the generated installer **contains that device's secret**. Use `set -o pipefail` if piping through a Bash shell. Android shared storage needs `termux-setup-storage`. Install Termux:Boot, disable battery optimization, and use a wake lock to keep the agent online. Agent files are under `~/.arena-device/`.
+6. `docker compose exec -T bridge node make-prompt.mjs --short` prints the short AI prompt. It contains the main token: share only with a trusted session. Public `/health` returns only `{ "ok": true }`; authenticated `/devices` provides live details.
 
-Paste the one-liner from step 1 at the start of a new chat (`docker compose exec bridge node make-prompt.mjs --short` prints it again). The agent fetches the full instructions from `GET /prompt` and runs `python3 b.py devices` to see what is online. For MCP clients use `https://bridge.example.com/mcp` with the bearer token.
+## Migration checklist
 
-## HTTP API (Bearer token)
+Back up `.env`, `policy.json` and `/data`; plan downtime and stage the new hash and distinct device tokens before rebuilding the server. Remove the old plaintext `UNLOCK_PASSWORD` and obsolete `ALLOW_GET_EXEC`. Make sure the existing data volume is writable by UID 1000. Reinstall both Mac and Android agents with the named installer URL; older device agents cannot connect. Check `/devices`, locked refusal, unlock/lock and the audit log in a test environment. Rotate old credentials where appropriate. For an intentionally unprotected *test* deployment only, set `DISABLE_POLICY=1` explicitly; production should not disable the policy.
 
-| | |
-|---|---|
-| `GET /health` (no auth) · `GET /devices` · `GET /tools` · `GET /policy` | status |
-| `POST /exec {"device":"mac","command":"…","cwd":"~","timeout_sec":90}` | run a command (omit `device` for the hub) |
-| `POST /call {"tool":"mac__edit_file","args":{…}}` | any tool |
-| `GET / PUT / DELETE /files/@mac/<path>` | raw bytes (omit `@name/` for the hub) |
-| `POST /unlock {"password":"…"}` · `POST /lock` | password gate |
-| `POST /mcp` | MCP Streamable HTTP (stateless) |
-| `GET /prompt` · `/client.py` · `/install-device.sh` | helpers with the URL/token baked in |
+## Interface and limits
 
-### GET compatibility (opt-in)
+- Main-token endpoints: `/mcp`, `POST /call`, `POST /exec`, `/files`, `/devices`, `/prompt`. Device tokens are limited to device status and client code retrieval.
+- Unlock using JSON `POST /unlock`, never via a password-bearing URL. Side-effecting GET routes have been removed.
+- Single binary files are limited to about 8 MB; request limits are 16 MB. Large files need a different transport; chunked uploads are not implemented.
+- The authorization policy does not prevent malicious code after unlock or filesystem races. Never mount a host Docker socket into the bridge. Audit logs record action metadata, not raw commands or inputs.
+- The hub fails closed without a valid `UNLOCK_PASSWORD_HASH` unless `DISABLE_POLICY=1` is explicit. Unregistered devices cannot join.
 
-Some web-AI sandboxes can only issue **GET** (their only outbound tool is a URL fetcher), even though TLS to your host works. Set `ALLOW_GET_EXEC=1` to expose `GET /exec` and `GET /call` **in addition to** POST:
+Run `npm ci && npm test` (Node 22 recommended). The legacy Mac-as-hub setup/service scripts have not been migrated to the new credential format and are not a supported production deployment path for this release. The VPS Docker path is tested. MIT licensed.
 
-```
-GET /exec?token=…&rid=<unique>&command=<url-encoded>[&device=mac&cwd=~&timeout_sec=90]
-GET /call?token=…&rid=<unique>&tool=mac__read_file&args=<url-encoded-JSON>
-```
-
-Each request must carry a unique `rid`: a GET can be prefetched or retried by the platform, so the bridge runs each `rid` at most once and replays the cached result for repeats — a duplicated GET never executes twice. `HEAD` is refused (405), the query string is length-capped, responses are `no-store`, and `unlock`/`lock` are **not** available over GET (the password must never travel in a URL). Token may ride in an `x-token` header instead of the query. It stays off by default; prefer POST/MCP whenever the sandbox can.
-
-## Security notes
-
-* The token is a shell on every attached machine; treat it like a root password. Rotate: edit `.env`, `docker compose up -d`, re-run the device install lines.
-* **Credential-read protection (on by default):** reading obvious secrets (`.ssh/*`, `.env`, `*.pem`/`*.key`, `.aws/`, `.git-credentials`, `id_rsa`…) requires an unlock first, so a leaked token cannot silently exfiltrate keys. Set `SENSITIVE_READ_OPEN=1` to disable. Everything else is still readable without a password.
-* The directory policy is enforced on the hub. Path tools are checked exactly; `bash`/`start_process` are checked heuristically (cwd + paths in the command, `..` always counts as outside). `kill_process` and `self_update` change state and are gated until unlock; `write_process` (stdin to a session you started) stays available for interactive work. It is a guard rail against an agent wandering, not a sandbox against a hostile one.
-* **Audit log:** every state-changing call (exec/write/edit/delete/kill/unlock/lock) is appended as a JSON line to `<HOME>/audit.log` (the `/data` volume) — token and password are never written. Set `AUDIT_LOG=off` to disable or `AUDIT_LOG=/path` to relocate.
-* Prefer the `Authorization`/`x-token` header over `?token=` in a URL (query strings can land in proxy logs and browser history); responses are sent with `Referrer-Policy: no-referrer`.
-* Behind Cloudflare's proxy single requests are cut at 100 s and uploads at 100 MB; the prompt teaches the agent to use process sessions for long jobs. Direct (Caddy) deployments have no such limit.
-
-## Alternative: hub on your Mac
-
-No VPS? Run the hub on the Mac itself and expose it with a Cloudflare Tunnel: `./setup.sh bridge.example.com && ./setup-tunnel.sh && ./install-service.sh`.
-
-## Files
-
-`server.mjs` hub · `builtins.mjs` tools shared by hub and devices · `device-agent.mjs` device side · `policy.mjs` / `policy.json` password gate · `make-prompt.mjs` agent instructions · `docker-compose.yml` / `Dockerfile` / `Caddyfile` · `nginx/` reuse an existing nginx · `deploy-vps.sh` one-shot server install
-
-MIT — see [LICENSE](LICENSE). 中文说明见 [README.zh-CN.md](README.zh-CN.md).
+Security boundaries and residual risks: [SECURITY.md](SECURITY.md).

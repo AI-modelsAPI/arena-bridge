@@ -1,7 +1,7 @@
 {$BRIDGE_HOST} {
     encode gzip
     request_body {
-        max_size 2GB
+        max_size 16MB
     }
     reverse_proxy bridge:3777 {
         # long-running /exec calls: no proxy timeout (Caddy default is none; make it explicit)

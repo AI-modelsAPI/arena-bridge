@@ -4,13 +4,6 @@
   "hostname": "bridge.example.com",
   "defaultTimeoutSec": 90,
   "maxOutputChars": 200000,
-  "mcpServers": {
-    "dc": {
-      "command": "node",
-      "args": [
-        "${BRIDGE_DIR}/node_modules/@wonderwhy-er/desktop-commander/dist/index.js"
-      ]
-    }
-  },
+  "mcpServers": {},
   "localName": "hub"
 }

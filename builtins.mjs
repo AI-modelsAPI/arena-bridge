@@ -13,7 +13,12 @@ export function createBuiltins(opts = {}) {
   const MAX_OUT = opts.maxOutputChars || Number(process.env.MAX_OUTPUT_CHARS) || 200_000;
   const DEFAULT_TIMEOUT = opts.defaultTimeoutSec || Number(process.env.DEFAULT_TIMEOUT_SEC) || 90;
   const MAX_TIMEOUT = opts.maxTimeoutSec || Number(process.env.MAX_TIMEOUT_SEC) || 1800;
-  const MAX_B64_BYTES = 100 * 1024 * 1024;
+  const MAX_B64_BYTES = 8 * 1024 * 1024;
+  // Never inherit bridge credentials or unlock configuration into user-controlled commands.
+  const shellEnv = () => Object.fromEntries(
+    ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'SHELL', 'TZ', 'PREFIX'].filter(k => process.env[k] !== undefined).map(k => [k, process.env[k]])
+  );
+  const childEnv = () => ({ ...shellEnv(), HOME, TERM: 'dumb' });
 
   const expand = p => {
     if (!p || p === '~') return HOME;
@@ -29,7 +34,7 @@ export function createBuiltins(opts = {}) {
     return new Promise(resolve => {
       let out = '', err = '', timedOut = false, done = false, child;
       try {
-        child = spawn(SHELL, ['-lc', command], { cwd: expand(cwd), env: { ...process.env, HOME, TERM: 'dumb' }, detached: true });
+        child = spawn(SHELL, ['-lc', command], { cwd: expand(cwd), env: childEnv(), detached: true });
       } catch (e) { return resolve({ code: -1, stdout: '', stderr: String(e), timedOut: false }); }
       const timer = setTimeout(() => { timedOut = true; try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, t * 1000);
       child.stdout.on('data', d => { if (out.length < MAX_OUT * 2) out += d; });
@@ -52,7 +57,7 @@ export function createBuiltins(opts = {}) {
       description: 'Start a long-running or interactive process in its own shell session (returns pid). Output is collected until you read it with read_process_output; send stdin with write_process. Use this instead of bash for anything over the request timeout (servers, builds, REPLs, downloads).',
       inputSchema: { type: 'object', properties: { command: { type: 'string' }, cwd: { type: 'string' }, wait_ms: { type: 'number', description: 'how long to wait for initial output (default 2000)' } }, required: ['command'] },
       run: async ({ command, cwd, wait_ms = 2000 }) => {
-        const child = spawn(SHELL, ['-lc', command], { cwd: expand(cwd), env: { ...process.env, HOME, TERM: 'dumb' }, detached: true });
+        const child = spawn(SHELL, ['-lc', command], { cwd: expand(cwd), env: childEnv(), detached: true });
         const s = { child, command, buf: '', exited: false, code: null, signal: null, startedAt: new Date().toISOString(), waiters: [] };
         sessions.set(child.pid, s);
         child.stdout.on('data', d => pushBuf(s, d.toString()));
@@ -156,7 +161,7 @@ export function createBuiltins(opts = {}) {
       run: async ({ path: p }) => { const f = expand(p); await fsp.rm(f, { recursive: true, force: true }); return textResult(`deleted ${f}`); },
     },
     read_file_base64: {
-      description: 'Read any file (binary ok, <=100MB) as base64.',
+      description: 'Read an authorized file (binary ok, <=8MB) as base64.',
       inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
       run: async ({ path: p }) => {
         const f = expand(p); const st = await fsp.stat(f);
@@ -169,7 +174,9 @@ export function createBuiltins(opts = {}) {
       inputSchema: { type: 'object', properties: { path: { type: 'string' }, data: { type: 'string' } }, required: ['path', 'data'] },
       run: async ({ path: p, data }) => {
         const f = expand(p); await fsp.mkdir(path.dirname(f), { recursive: true });
-        const buf = Buffer.from(data, 'base64'); await fsp.writeFile(f, buf);
+        const buf = Buffer.from(data, 'base64');
+        if (buf.length > MAX_B64_BYTES) return textResult(`file too large (${buf.length} bytes)`, true);
+        await fsp.writeFile(f, buf);
         return textResult(`wrote ${buf.length} bytes to ${f}`);
       },
     },

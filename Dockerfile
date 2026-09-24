@@ -17,7 +17,8 @@ COPY server.mjs builtins.mjs device-agent.mjs make-prompt.mjs policy.mjs policy.
 # Workspace lives in /data (mounted volume). HOME points there so "~" paths land on the volume.
 ENV HOME=/data BIND=0.0.0.0 PORT=3777 BRIDGE_SHELL=/bin/bash LOCAL_NAME=vps \
     DEFAULT_TIMEOUT_SEC=300 MAX_TIMEOUT_SEC=1800
-RUN mkdir -p /data && chmod 777 /data
+RUN mkdir -p /data && chown node:node /data && chmod 700 /data
+USER node
 VOLUME ["/data"]
 EXPOSE 3777
 HEALTHCHECK --interval=30s --timeout=5s CMD curl -sf http://127.0.0.1:3777/health || exit 1

@@ -4,6 +4,7 @@
 // Works on macOS, Linux, Android Termux. Needs Node >= 22 (built-in WebSocket) or the `ws` package.
 import os from 'node:os';
 import { createBuiltins } from './builtins.mjs';
+import { checkToolAccess } from './policy.mjs';
 
 const HUB = (process.env.HUB_URL || process.argv[2] || '').replace(/\/+$/, '');
 const TOKEN = process.env.BRIDGE_TOKEN || process.argv[3];
@@ -23,12 +24,12 @@ b.addTool('self_update', {
   run: async () => {
     const fs = await import('node:fs/promises'); const path = await import('node:path'); const { spawn } = await import('node:child_process');
     const dir = path.dirname(new URL(import.meta.url).pathname);
-    for (const f of ['builtins.mjs', 'device-agent.mjs']) {
+    for (const f of ['builtins.mjs', 'policy.mjs', 'device-agent.mjs']) {
       const r = await fetch(`${HUB}/${f}`, { headers: { Authorization: `Bearer ${TOKEN}`, 'User-Agent': 'arena-bridge-device/1.0' } });
       if (!r.ok) return b.textResult(`download ${f} failed: ${r.status}`, true);
       await fs.writeFile(path.join(dir, f + '.new'), await r.text());
     }
-    for (const f of ['builtins.mjs', 'device-agent.mjs']) await fs.rename(path.join(dir, f + '.new'), path.join(dir, f));
+    for (const f of ['builtins.mjs', 'policy.mjs', 'device-agent.mjs']) await fs.rename(path.join(dir, f + '.new'), path.join(dir, f));
     setTimeout(() => {
       if (!MANAGED) { const c = spawn(process.execPath, [path.join(dir, 'device-agent.mjs')], { detached: true, stdio: 'ignore', env: process.env }); c.unref(); }
       process.exit(0);
@@ -38,7 +39,7 @@ b.addTool('self_update', {
 });
 const isTermux = !!process.env.TERMUX_VERSION || (process.env.PREFIX || '').includes('com.termux');
 const info = { platform: isTermux ? 'android-termux' : os.platform(), hostname: os.hostname(), home: b.HOME, shell: b.SHELL, arch: os.arch(), node: process.version, label: LABEL, version: '0.3.0' };
-const url = `${HUB.replace(/^http/, 'ws')}/device?token=${encodeURIComponent(TOKEN)}&name=${encodeURIComponent(NAME)}`;
+const url = `${HUB.replace(/^http/, 'ws')}/device?name=${encodeURIComponent(NAME)}`;
 
 let backoff = 1000, ws = null, connected = false, lastActivity = Date.now(), reconnectTimer = null;
 function scheduleReconnect(reason) {
@@ -50,7 +51,7 @@ function scheduleReconnect(reason) {
 }
 function connect() {
   log(`connecting to ${HUB} ...`);
-  try { ws = new WS(url); } catch (e) { return scheduleReconnect(`connect failed: ${e.message}`); }
+  try { ws = new WS(url, ['arena-device-v1', `auth.${TOKEN}`]); } catch (e) { return scheduleReconnect(`connect failed: ${e.message}`); }
   const me = ws;
   me.onopen = () => { lastActivity = Date.now(); me.send(JSON.stringify({ type: 'hello', name: NAME, info, tools: b.listTools() })); };
   me.onmessage = async ev => {
@@ -59,8 +60,12 @@ function connect() {
     if (msg.type === 'welcome') { connected = true; backoff = 1000; log(`online as "${msg.name}" (${info.platform}, home=${info.home}, shell=${info.shell})`); }
     else if (msg.type === 'call') {
       const t0 = Date.now();
-      const result = await b.callTool(msg.tool, msg.args || {});
-      log(`${msg.tool} ${JSON.stringify(msg.args || {}).slice(0, 80)} -> ${result.isError ? 'ERR' : 'ok'} ${Date.now() - t0}ms`);
+      let denied = 'PROTECTED: missing hub policy';
+      if (msg.policy && typeof msg.policy.unlocked === 'boolean' && Array.isArray(msg.policy.allowedDirs)) {
+        denied = msg.policy.enabled === false ? null : await checkToolAccess({ tool: msg.tool, args: msg.args || {}, home: b.HOME, allowedDirs: msg.policy.allowedDirs, unlocked: msg.policy.unlocked });
+      }
+      const result = denied ? b.textResult(denied, true) : await b.callTool(msg.tool, msg.args || {});
+      log(`${msg.tool} -> ${result.isError ? 'ERR' : 'ok'} ${Date.now() - t0}ms`);
       try { me.send(JSON.stringify({ type: 'result', id: msg.id, result })); } catch (e) { log(`send failed: ${e.message}`); }
     }
   };
@@ -69,7 +74,7 @@ function connect() {
 }
 // keepalive: never let the event loop drain; watchdog: if silent for 90s (hub pings every 30s), force a reconnect.
 setInterval(() => {
-  if (connected && Date.now() - lastActivity > 90_000) { log('watchdog: no traffic for 90s, reconnecting'); try { ws?.close(); } catch {} scheduleReconnect('watchdog'); }
-}, 15_000);
+  if (connected && Date.now() - lastActivity > Number(process.env.DEVICE_WATCHDOG_MS || 90_000)) { log('watchdog: no traffic for 90s, reconnecting'); try { ws?.close(); } catch {} scheduleReconnect('watchdog'); }
+}, Math.min(15_000, Number(process.env.DEVICE_WATCHDOG_MS || 90_000) / 3));
 connect();
 process.on('SIGTERM', () => process.exit(0));
