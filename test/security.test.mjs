@@ -45,6 +45,32 @@ test('locked policy fails closed on execution and secret or escaping paths', asy
   } finally { await fs.rm(d.root, { recursive: true, force: true }); }
 });
 
+test('fresh VPS initializer creates private, usable credentials', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'arena-setup-'));
+  try {
+    const envFile = path.join(dir, '.env');
+    const p = spawnSync('python3', ['scripts/init-config.py', '--host', 'bridge.example.com', '--devices', 'mac,android', '--output', envFile, '--password-stdin'],
+      {cwd: ROOT, input: 'correct horse battery staple\n', encoding: 'utf8'});
+    assert.equal(p.status, 0, p.stderr);
+    assert.equal((await fs.stat(envFile)).mode & 0o777, 0o600);
+    const text = await fs.readFile(envFile, 'utf8');
+    const hash = /UNLOCK_PASSWORD_HASH='([^']+)'/.exec(text)?.[1];
+    const keys = JSON.parse(/DEVICE_TOKENS_JSON='([^']+)'/.exec(text)[1]);
+    const token = /BRIDGE_TOKEN=([a-f0-9]+)/.exec(text)[1];
+    assert.ok(hash && keys.mac !== keys.android && keys.mac !== token);
+    assert.equal(createPolicy({passwordHash: hash}).unlock('correct horse battery staple').ok, true);
+    const again = spawnSync('python3', ['scripts/init-config.py', '--host', 'bridge.example.com', '--output', envFile, '--password-stdin'],
+      {cwd: ROOT, input: 'correct horse battery staple\n', encoding:'utf8'});
+    assert.notEqual(again.status, 0, 'setup must not overwrite an existing .env');
+    assert.equal(await fs.readFile(envFile,'utf8'), text);
+    await fs.copyFile(path.join(ROOT, 'show-setup.sh'), path.join(dir, 'show-setup.sh'));
+    const shown = spawnSync('bash', [path.join(dir,'show-setup.sh'),'mac'], {cwd:dir,encoding:'utf8'});
+    assert.equal(shown.status,0,shown.stderr);
+    assert.ok(shown.stdout.includes(keys.mac) && !shown.stdout.includes(token), 'show-setup should reveal only a device token');
+    assert.equal(spawnSync('bash',['-n'],{input:shown.stdout}).status,0,'printed installer command must parse as shell');
+  } finally { await fs.rm(dir, {recursive:true, force:true}); }
+});
+
 test('plaintext password and missing hash must fail at startup', () => {
   assert.throws(() => createPolicy({}), /UNLOCK_PASSWORD_HASH/);
   assert.throws(() => hashPassword('short'), /at least 16/);
@@ -79,6 +105,9 @@ test('HTTP auth, device scope and no URL credentials', { timeout: 20000 }, async
     const auth = token => ({ Authorization: `Bearer ${token}` });
     assert.deepEqual(await (await fetch(base + '/health')).json(), { ok: true });
     assert.equal((await fetch(base + '/devices', { headers: auth(macToken) })).status, 401);
+    assert.equal((await fetch(base + '/install-device.sh?name=android', {headers:auth(macToken)})).status,401);
+    const ownInstaller = await (await fetch(base + '/install-device.sh?name=mac',{headers:auth(macToken)})).text();
+    assert.ok(ownInstaller.includes(macToken) && !ownInstaller.includes(mainToken));
     assert.equal((await fetch(base + '/devices', { headers: auth(mainToken) })).status, 200);
     assert.equal((await fetch(base + '/devices?token=' + mainToken)).status, 401);
     const status = await (await fetch(base + '/device-status?name=mac', { headers: auth(macToken) })).json();

@@ -171,6 +171,7 @@ app.use((req, res, next) => {
   const device = [...DEVICE_TOKENS].find(([, key]) => key === t)?.[0];
   if (device && req.method === 'GET' && ['/device-agent.mjs', '/builtins.mjs', '/policy.mjs'].includes(req.path)) return next();
   if (device && req.method === 'GET' && req.path === '/device-status' && req.query.name === device) return next();
+  if (device && req.method === 'GET' && req.path === '/install-device.sh' && req.query.name === device) return next();
   log(`401 ${req.method} ${req.path} from ${req.ip}`); return res.status(401).json({ error: 'unauthorized' });
 });
 app.get('/tools', (_req, res) => res.json(allTools()));

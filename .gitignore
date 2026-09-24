@@ -6,3 +6,5 @@ prompt.txt
 *.log
 *.tgz
 .DS_Store
+
+__pycache__/
